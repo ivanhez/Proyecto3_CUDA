@@ -14,8 +14,8 @@ const int rBins = 100;
 const float radInc = degreeInc * M_PI / 180;
 
 //*****************************************************************
-// Declaración de memoria constante
-#ifdef USE_CONSTANT_MEMORY
+// Declaración de memoria constante (scope global)
+#if defined(USE_CONSTANT_MEMORY) || defined(USE_SHARED_MEMORY)
 __constant__ float d_Cos[degreeBins];
 __constant__ float d_Sin[degreeBins];
 #endif
@@ -134,16 +134,12 @@ void drawDetectedLines(unsigned char *img, int w, int h, int *acc,
                 float r = (rIdx * rScale) - rMax;
                 
                 // Calcular dos puntos en la línea para dibujarla
-                // Usamos los bordes de la imagen
                 int x0, y0, x1, y1;
                 
                 if (fabs(sin(theta)) > 0.001) // Línea no vertical
                 {
-                    // Punto en x = 0
                     x0 = 0;
                     y0 = yCent - (int)((r - (x0 - xCent) * cos(theta)) / sin(theta));
-                    
-                    // Punto en x = w-1
                     x1 = w - 1;
                     y1 = yCent - (int)((r - (x1 - xCent) * cos(theta)) / sin(theta));
                 }
@@ -165,16 +161,14 @@ void drawDetectedLines(unsigned char *img, int w, int h, int *acc,
 }
 
 //*****************************************************************
-// Función para calcular threshold automático (promedio + 2*stddev)
+// Función para calcular threshold automático
 int calculateThreshold(int *acc, int size)
 {
-    // Calcular promedio
     long long sum = 0;
     for (int i = 0; i < size; i++)
         sum += acc[i];
     float mean = (float)sum / size;
     
-    // Calcular desviación estándar
     float variance = 0;
     for (int i = 0; i < size; i++)
     {
@@ -194,60 +188,108 @@ int calculateThreshold(int *acc, int size)
 }
 
 //*****************************************************************
-// Kernel con memoria constante (sin parámetros d_Cos y d_Sin)
-#ifdef USE_CONSTANT_MEMORY
+// Kernel con MEMORIA COMPARTIDA
+#ifdef USE_SHARED_MEMORY
 __global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, 
                                float rMax, float rScale)
 {
-  // Cálculo del ID global del thread
+  // Definir locID usando IDs de los hilos del bloque
+  int locID = threadIdx.x;
+  int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  // Definir acumulador local en memoria compartida
+  __shared__ int localAcc[degreeBins * rBins];
+  
+  // Inicializar a 0 el acumulador local
+  // Cada hilo inicializa múltiples elementos
+  for (int i = locID; i < degreeBins * rBins; i += blockDim.x)
+  {
+    localAcc[i] = 0;
+  }
+  
+  // Barrera para asegurar que la inicialización está completa
+  __syncthreads();
+  
+  if (gloID < w * h)
+  {
+    int xCent = w / 2;
+    int yCent = h / 2;
+    int xCoord = gloID % w - xCent;
+    int yCoord = yCent - gloID / w;
+
+    if (pic[gloID] > 0)
+    {
+      for (int tIdx = 0; tIdx < degreeBins; tIdx++)
+      {
+        float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
+        int rIdx = (r + rMax) / rScale;
+        
+        // Usar acumulador local con operación atómica
+        atomicAdd(&localAcc[rIdx * degreeBins + tIdx], 1);
+      }
+    }
+  }
+  
+  // Barrera para asegurar que todos completaron el incremento
+  __syncthreads();
+  
+  // Sumar acumulador local al global
+  for (int i = locID; i < degreeBins * rBins; i += blockDim.x)
+  {
+    atomicAdd(&acc[i], localAcc[i]);
+  }
+}
+
+//*****************************************************************
+// Kernel con MEMORIA CONSTANTE (sin compartida)
+#elif defined(USE_CONSTANT_MEMORY)
+__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, 
+                               float rMax, float rScale)
+{
   int gloID = blockIdx.x * blockDim.x + threadIdx.x;
   
   if (gloID >= w * h) return;
 
   int xCent = w / 2;
   int yCent = h / 2;
-
-  // Conversión de índice lineal a coordenadas cartesianas centradas
   int xCoord = gloID % w - xCent;
   int yCoord = yCent - gloID / w;
 
   if (pic[gloID] > 0)
+  {
+    for (int tIdx = 0; tIdx < degreeBins; tIdx++)
     {
-      for (int tIdx = 0; tIdx < degreeBins; tIdx++)
-        {
-          // Acceso a memoria constante (d_Cos y d_Sin son globales)
-          float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
-          int rIdx = (r + rMax) / rScale;
-          atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
-        }
+      float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
+      int rIdx = (r + rMax) / rScale;
+      atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
     }
+  }
 }
+
+//*****************************************************************
+// Kernel con MEMORIA GLOBAL únicamente
 #else
-// Kernel con memoria global
 __global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, 
                                float rMax, float rScale, float *d_Cos, float *d_Sin)
 {
-  // Cálculo del ID global del thread
   int gloID = blockIdx.x * blockDim.x + threadIdx.x;
   
   if (gloID >= w * h) return;
 
   int xCent = w / 2;
   int yCent = h / 2;
-
-  // Conversión de índice lineal a coordenadas cartesianas centradas
   int xCoord = gloID % w - xCent;
   int yCoord = yCent - gloID / w;
 
   if (pic[gloID] > 0)
+  {
+    for (int tIdx = 0; tIdx < degreeBins; tIdx++)
     {
-      for (int tIdx = 0; tIdx < degreeBins; tIdx++)
-        {
-          float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
-          int rIdx = (r + rMax) / rScale;
-          atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
-        }
+      float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
+      int rIdx = (r + rMax) / rScale;
+      atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
     }
+  }
 }
 #endif
 
@@ -261,10 +303,12 @@ int main (int argc, char **argv)
   }
 
   printf("==============================================\n");
-  #ifdef USE_CONSTANT_MEMORY
-  printf("MODO: Usando MEMORIA CONSTANTE\n");
+  #ifdef USE_SHARED_MEMORY
+  printf("MODO: Usando MEMORIA GLOBAL + CONSTANTE + COMPARTIDA\n");
+  #elif defined(USE_CONSTANT_MEMORY)
+  printf("MODO: Usando MEMORIA GLOBAL + CONSTANTE\n");
   #else
-  printf("MODO: Usando MEMORIA GLOBAL\n");
+  printf("MODO: Usando MEMORIA GLOBAL únicamente\n");
   #endif
   printf("==============================================\n\n");
 
@@ -276,7 +320,7 @@ int main (int argc, char **argv)
   int h = inImg.y_dim;
 
   // Variables para memoria global
-  #ifndef USE_CONSTANT_MEMORY
+  #if !defined(USE_CONSTANT_MEMORY) && !defined(USE_SHARED_MEMORY)
   float* d_Cos;
   float* d_Sin;
   cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
@@ -286,7 +330,7 @@ int main (int argc, char **argv)
   // CPU calculation
   CPU_HoughTran(inImg.pixels, w, h, &cpuht);
 
-  // pre-compute values to be stored
+  // Pre-calcular valores trigonométricos
   float *pcCos = (float *) malloc (sizeof (float) * degreeBins);
   float *pcSin = (float *) malloc (sizeof (float) * degreeBins);
   float rad = 0;
@@ -300,19 +344,18 @@ int main (int argc, char **argv)
   float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
   float rScale = 2 * rMax / rBins;
 
-  // Copiar a memoria del device (Constante o Global según el modo)
-  #ifdef USE_CONSTANT_MEMORY
-  // Usar cudaMemcpyToSymbol para memoria constante
+  // Copiar valores trigonométricos al device
+  #if defined(USE_CONSTANT_MEMORY) || defined(USE_SHARED_MEMORY)
   cudaMemcpyToSymbol(d_Cos, pcCos, sizeof (float) * degreeBins);
   cudaMemcpyToSymbol(d_Sin, pcSin, sizeof (float) * degreeBins);
   printf("Valores trigonométricos copiados a MEMORIA CONSTANTE\n");
   #else
-  // Usar cudaMemcpy para memoria global
   cudaMemcpy(d_Cos, pcCos, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
   cudaMemcpy(d_Sin, pcSin, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
   printf("Valores trigonométricos copiados a MEMORIA GLOBAL\n");
   #endif
 
+  // Setup y copia de datos host->device
   unsigned char *d_in, *h_in;
   int *d_hough, *h_hough;
 
@@ -324,6 +367,7 @@ int main (int argc, char **argv)
   cudaMemcpy (d_in, h_in, sizeof (unsigned char) * w * h, cudaMemcpyHostToDevice);
   cudaMemset (d_hough, 0, sizeof (int) * degreeBins * rBins);
 
+  // Configuración de ejecución
   int blockNum = ceil (w * h / 256.0);
   
   // Crear eventos CUDA para medir tiempo
@@ -334,8 +378,8 @@ int main (int argc, char **argv)
   // Registrar tiempo de inicio
   cudaEventRecord(start);
   
-  // Llamada al kernel
-  #ifdef USE_CONSTANT_MEMORY
+  // Llamada al kernel según el modo
+  #if defined(USE_CONSTANT_MEMORY) || defined(USE_SHARED_MEMORY)
   GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
   #else
   GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
@@ -348,27 +392,30 @@ int main (int argc, char **argv)
   // Calcular tiempo transcurrido
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
-  #ifdef USE_CONSTANT_MEMORY
-  printf("\nKernel execution time (Constant Memory): %f ms\n", milliseconds);
+  
+  #ifdef USE_SHARED_MEMORY
+  printf("\nKernel execution time (Global + Constant + Shared Memory): %f ms\n", milliseconds);
+  #elif defined(USE_CONSTANT_MEMORY)
+  printf("\nKernel execution time (Global + Constant Memory): %f ms\n", milliseconds);
   #else
-  printf("\nKernel execution time (Global Memory): %f ms\n", milliseconds);
+  printf("\nKernel execution time (Global Memory only): %f ms\n", milliseconds);
   #endif
   
   // Destruir eventos
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
-  // get results from device
+  // Obtener resultados del device
   cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
 
-  // compare CPU and GPU results
+  // Comparar resultados CPU vs GPU
   int mismatches = 0;
   for (i = 0; i < degreeBins * rBins; i++)
   {
     if (cpuht[i] != h_hough[i])
     {
       mismatches++;
-      if (mismatches <= 5) // Solo mostrar primeros 5
+      if (mismatches <= 5)
         printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
     }
   }
@@ -379,10 +426,9 @@ int main (int argc, char **argv)
          mismatches, degreeBins * rBins, 
          100.0 * mismatches / (degreeBins * rBins));
 
-  //Generar imagen con líneas detectadas
+  // Generar imagen con líneas detectadas
   printf("\n=== Generando imagen con líneas detectadas ===\n");
   
-  // Calcular threshold (usar argumento o automático)
   int threshold;
   if (argc >= 3)
   {
@@ -394,17 +440,17 @@ int main (int argc, char **argv)
       threshold = calculateThreshold(h_hough, degreeBins * rBins);
   }
   
-  // Convertir imagen a RGB
   unsigned char *rgbImg = convertToRGB(inImg.pixels, w, h);
-  
-  // Dibujar líneas detectadas
   drawDetectedLines(rgbImg, w, h, h_hough, rMax, rScale, threshold);
   
-  // Guardar imagen
-  #ifdef USE_CONSTANT_MEMORY
-  const char *outputFile = "output_lines_constant.png";
+  // Nombre de archivo según el modo
+  const char *outputFile;
+  #ifdef USE_SHARED_MEMORY
+  outputFile = "output_lines_shared.png";
+  #elif defined(USE_CONSTANT_MEMORY)
+  outputFile = "output_lines_constant.png";
   #else
-  const char *outputFile = "output_lines_global.png";
+  outputFile = "output_lines_global.png";
   #endif
   
   if (stbi_write_png(outputFile, w, h, 3, rgbImg, w * 3))
@@ -416,15 +462,13 @@ int main (int argc, char **argv)
       printf("Error al guardar la imagen\n");
   }
   
-  // Liberar memoria RGB
   free(rgbImg);
 
   // Limpieza de memoria
   cudaFree(d_in);
   cudaFree(d_hough);
   
-  // Solo liberar d_Cos y d_Sin si usamos memoria global
-  #ifndef USE_CONSTANT_MEMORY
+  #if !defined(USE_CONSTANT_MEMORY) && !defined(USE_SHARED_MEMORY)
   cudaFree(d_Cos);
   cudaFree(d_Sin);
   #endif
